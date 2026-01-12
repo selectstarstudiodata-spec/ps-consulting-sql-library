@@ -1,0 +1,68 @@
+/*
+Title: Student Roster Extract (Portfolio)
+
+Purpose:
+Returns a student roster dataset suitable for downstream systems
+(e.g., LMS, assessment, rostering) using a standardized definition
+of "currently active enrollment."
+
+Parameters:
+- :as_of_date   DATE  -- Effective date for roster membership
+- :school_id    INT   -- Optional filter for a specific school
+
+Outputs (typical columns):
+- student_id, state_id, local_id
+- first_name, last_name
+- grade_level, school_id
+- enroll_date, exit_date
+
+Notes:
+- This is a representative portfolio extract.
+- Replace generalized table/field names to match your environment.
+- Do not include PII in public repos beyond what is necessary to
+  demonstrate logic.
+
+Change Log:
+- 2026-01-12 - Initial version
+*/
+
+WITH active_enrollment AS (
+    SELECT
+        s.student_id,
+        s.school_id,
+        s.grade_level,
+        s.enroll_date,
+        s.exit_date
+    FROM students s
+    WHERE
+        s.enroll_date <= :as_of_date
+        AND (
+            s.exit_date IS NULL
+            OR s.exit_date >= :as_of_date
+        )
+        AND s.active_flag = 1
+        AND (
+            :school_id IS NULL
+            OR s.school_id = :school_id
+        )
+)
+SELECT
+    ae.student_id,
+    id.state_id,
+    id.local_id,
+    dem.first_name,
+    dem.last_name,
+    ae.grade_level,
+    ae.school_id,
+    ae.enroll_date,
+    ae.exit_date
+FROM active_enrollment ae
+LEFT JOIN student_identifiers id
+    ON id.student_id = ae.student_id
+LEFT JOIN student_demographics dem
+    ON dem.student_id = ae.student_id
+ORDER BY
+    ae.school_id,
+    ae.grade_level,
+    dem.last_name,
+    dem.first_name;
