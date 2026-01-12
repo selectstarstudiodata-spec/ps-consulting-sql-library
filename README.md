@@ -1,5 +1,5 @@
 # ps-consulting-sql-library
-Logic for Batched PowerSchool Extracts
+Portfolio-ready PowerSchool SQL library demonstrating reusable enrollment logic, roster extracts, and SIS data validation with clear documentation and safe practices.
 Reusable SQL patterns and extract logic for PowerSchool consulting work.
 
 ## Purpose
