@@ -1,0 +1,22 @@
+# OS / Editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Output files (never commit)
+*.csv
+*.tsv
+*.xlsx
+*.json
+*.xml
+*.log
+
+# Local configs / secrets
+.env
+*.env
+config/*.json
+config/*.yml
+config/*.yaml
+*secret*
+*credential*
