@@ -1,0 +1,184 @@
+/* ============================================================================
+   ETL: PowerSchool -> Infinite Campus
+   Target file: gradeLevel.csv
+
+   - Uses SAME enrollment base logic as enrollment.sql
+   - students + reenrollments union
+   - Year assignment via date overlap to year-record TERMS
+============================================================================ */
+
+WITH
+school_key_map AS (
+  SELECT id AS school_key, school_number AS schoolNum, name AS schoolName FROM ps.schools
+  UNION ALL SELECT dcid, school_number, name FROM ps.schools
+  UNION ALL SELECT school_number, school_number, name FROM ps.schools
+),
+
+yearrec_terms AS (
+  SELECT
+    CAST(skm.schoolNum AS VARCHAR2(10))   AS schoolNum_raw,
+    CAST(skm.schoolName AS VARCHAR2(60))  AS schoolName_raw,
+    t.id                                  AS year_termid,
+    t.firstday                            AS startDate_dt,
+    t.lastday                             AS endDate_dt,
+    EXTRACT(YEAR FROM t.firstday) + 1     AS school_year_end_year
+  FROM ps.terms t
+  JOIN school_key_map skm
+    ON skm.school_key = t.schoolid
+  WHERE skm.schoolNum IS NOT NULL
+    AND skm.schoolNum <> 999999
+    AND t.isyearrec = 1
+),
+
+calendar_by_school_year AS (
+  SELECT
+    y.schoolNum_raw,
+    y.year_termid,
+    y.startDate_dt,
+    y.endDate_dt,
+    y.school_year_end_year,
+    SUBSTR(TO_CHAR(EXTRACT(YEAR FROM y.startDate_dt)), -2) || '-' ||
+    SUBSTR(TO_CHAR(EXTRACT(YEAR FROM y.startDate_dt) + 1), -2) || ' ' ||
+    SUBSTR(TRIM(y.schoolName_raw),1,23) AS calendarName_raw
+  FROM yearrec_terms y
+),
+
+base_enr AS (
+  SELECT
+    s.id AS studentid,
+    s.grade_level AS grade_level_raw,
+    s.schoolid AS school_key,
+    s.entrydate AS startDate_raw,
+    s.exitdate  AS endDate_raw
+  FROM ps.students s
+  WHERE s.entrydate IS NOT NULL
+),
+
+hist_enr AS (
+  SELECT
+    r.studentid,
+    r.grade_level AS grade_level_raw,
+    r.schoolid AS school_key,
+    r.entrydate AS startDate_raw,
+    r.exitdate  AS endDate_raw
+  FROM ps.reenrollments r
+  WHERE r.entrydate IS NOT NULL
+),
+
+all_enr AS (
+  SELECT * FROM base_enr
+  UNION ALL
+  SELECT * FROM hist_enr
+),
+
+enr_mapped AS (
+  SELECT
+    ae.studentid,
+    ae.grade_level_raw,
+    skm.schoolNum AS schoolNum_raw,
+    skm.schoolName AS schoolName_raw,
+    c.calendarName_raw,
+    c.school_year_end_year
+  FROM all_enr ae
+  JOIN school_key_map skm
+    ON skm.school_key = ae.school_key
+  JOIN calendar_by_school_year c
+    ON c.schoolNum_raw = CAST(skm.schoolNum AS VARCHAR2(10))
+   AND ae.startDate_raw <= c.endDate_dt
+   AND NVL(ae.endDate_raw, c.endDate_dt) >= c.startDate_dt
+  WHERE skm.schoolNum IS NOT NULL
+    AND skm.schoolNum <> 999999
+),
+
+ps_source AS (
+  SELECT schoolNum_raw, calendarName_raw, grade_level_raw
+  FROM (
+    SELECT
+      em.schoolNum_raw,
+      em.calendarName_raw,
+      em.grade_level_raw,
+      ROW_NUMBER() OVER (
+        PARTITION BY em.schoolNum_raw, em.calendarName_raw, em.grade_level_raw
+        ORDER BY em.grade_level_raw
+      ) rn
+    FROM enr_mapped em
+    WHERE em.grade_level_raw IS NOT NULL
+  )
+  WHERE rn = 1
+),
+
+grade_seq_map AS (
+  SELECT
+    p.schoolNum_raw,
+    p.calendarName_raw,
+    LPAD(TRIM(TO_CHAR(p.grade_level_raw)),2,'0') AS gradeLevel,
+    TRIM(TO_CHAR(p.grade_level_raw)) AS stateGradeLevel,
+    CASE
+      WHEN UPPER(TRIM(TO_CHAR(p.grade_level_raw))) IN ('PK','PREK','PRE-K','P3','P4') THEN 4
+      WHEN UPPER(TRIM(TO_CHAR(p.grade_level_raw))) = 'K' THEN 5
+      WHEN REGEXP_LIKE(TRIM(TO_CHAR(p.grade_level_raw)), '^\d+$')
+        THEN TO_NUMBER(TRIM(p.grade_level_raw)) + 5
+      ELSE NULL
+    END AS gradeSeq
+  FROM ps_source p
+),
+
+xform AS (
+  SELECT
+    SUBSTR(TRIM(schoolNum_raw),1,10) AS schoolNum,
+    SUBSTR(TRIM(calendarName_raw),1,60) AS calendarName,
+    SUBSTR(TRIM(gradeLevel),1,20) AS gradeLevel,
+    SUBSTR(TRIM(stateGradeLevel),1,20) AS stateGradeLevel,
+    gradeSeq
+  FROM grade_seq_map
+),
+
+validated AS (
+  SELECT
+    x.*,
+    TRIM(
+      CASE WHEN schoolNum IS NULL THEN 'ERR_REQUIRED_schoolNum; ' END ||
+      CASE WHEN calendarName IS NULL THEN 'ERR_REQUIRED_calendarName; ' END ||
+      CASE WHEN gradeLevel IS NULL THEN 'ERR_REQUIRED_gradeLevel; ' END ||
+      CASE WHEN gradeSeq IS NULL THEN 'ERR_REQUIRED_gradeSeq; ' END
+    ) AS validation_errors
+  FROM xform x
+),
+
+final_data AS (
+  SELECT
+    CASE
+      WHEN validation_errors IS NULL OR TRIM(validation_errors) = '' THEN 'CLEAN'
+      ELSE 'ERROR'
+    END AS row_type,
+    schoolNum,
+    calendarName,
+    gradeLevel,
+    stateGradeLevel,
+    gradeSeq,
+    NVL(validation_errors,'') AS validation_errors
+  FROM validated
+),
+
+data_rows AS (
+  SELECT ROW_NUMBER() OVER (ORDER BY schoolNum, calendarName, gradeSeq) AS data_order, f.*
+  FROM final_data f
+)
+
+SELECT line
+FROM (
+  SELECT 0 AS sort_order, 0 AS data_order,
+         '"row_type","schoolNum","calendarName","gradeLevel","stateGradeLevel","gradeSeq","validation_errors"' AS line
+  FROM dual
+  UNION ALL
+  SELECT 1, data_order,
+         '"'||row_type||'","'||
+         schoolNum||'","'||
+         calendarName||'","'||
+         gradeLevel||'","'||
+         stateGradeLevel||'","'||
+         gradeSeq||'","'||
+         validation_errors||'"'
+  FROM data_rows
+)
+ORDER BY sort_order, data_order;
