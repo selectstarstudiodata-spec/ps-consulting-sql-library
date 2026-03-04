@@ -1,0 +1,174 @@
+WITH
+school_key_map AS (
+    SELECT id AS school_key, school_number AS schoolNum, name AS schoolName FROM ps.schools
+    UNION ALL SELECT dcid, school_number, name FROM ps.schools
+    UNION ALL SELECT school_number, school_number, name FROM ps.schools
+),
+
+yearrec_terms AS (
+  SELECT
+    CAST(skm.schoolNum AS VARCHAR2(10))   AS schoolNum_raw,
+    CAST(skm.schoolName AS VARCHAR2(60))  AS schoolName_raw,
+    t.id                                  AS year_termid,
+    t.firstday                            AS startDate_dt,
+    t.lastday                             AS endDate_dt,
+    EXTRACT(YEAR FROM t.firstday) + 1     AS school_year_end_year
+  FROM ps.terms t
+  JOIN school_key_map skm
+    ON skm.school_key = t.schoolid
+  WHERE skm.schoolNum IS NOT NULL
+    AND skm.schoolNum <> 999999
+    AND t.isyearrec = 1
+),
+
+calendar_by_school_year AS (
+  SELECT
+    y.schoolNum_raw,
+    y.year_termid,
+    y.startDate_dt,
+    y.endDate_dt,
+    y.school_year_end_year,
+    SUBSTR(TO_CHAR(EXTRACT(YEAR FROM y.startDate_dt)), -2) || '-' ||
+    SUBSTR(TO_CHAR(EXTRACT(YEAR FROM y.startDate_dt) + 1), -2) || ' ' ||
+    SUBSTR(TRIM(y.schoolName_raw),1,23) AS calendarName_raw
+  FROM yearrec_terms y
+),
+
+base_enr AS (
+  SELECT
+    s.id AS studentid,
+    CAST(TO_CHAR(s.student_number) AS VARCHAR2(15)) AS studentNum_raw,
+    s.entrydate AS startDate_raw,
+    s.exitdate  AS endDate_raw,
+    s.grade_level AS grade_level_raw,
+    s.schoolid AS school_key,
+    CAST(s.entrycode AS VARCHAR2(20)) AS localStartStatus_raw,
+    CAST(s.exitcode AS VARCHAR2(20)) AS localEndStatus_raw,
+    'STUDENTS' AS sourceTable_raw
+  FROM ps.students s
+  WHERE s.entrydate IS NOT NULL
+),
+
+hist_enr AS (
+  SELECT
+    r.studentid,
+    CAST(TO_CHAR(s.student_number) AS VARCHAR2(15)) AS studentNum_raw,
+    r.entrydate AS startDate_raw,
+    r.exitdate  AS endDate_raw,
+    r.grade_level AS grade_level_raw,
+    r.schoolid AS school_key,
+    CAST(r.entrycode AS VARCHAR2(20)) AS localStartStatus_raw,
+    CAST(r.exitcode AS VARCHAR2(20)) AS localEndStatus_raw,
+    'REENROLLMENTS' AS sourceTable_raw
+  FROM ps.reenrollments r
+  JOIN ps.students s ON s.id = r.studentid
+  WHERE r.entrydate IS NOT NULL
+),
+
+ps_source AS (
+  SELECT * FROM base_enr
+  UNION ALL
+  SELECT * FROM hist_enr
+),
+
+enr_mapped AS (
+  SELECT
+    p.*,
+    skm.schoolNum AS schoolNum_raw,
+    skm.schoolName AS schoolName_raw,
+    c.calendarName_raw,
+    c.school_year_end_year
+  FROM ps_source p
+  JOIN school_key_map skm
+    ON skm.school_key = p.school_key
+  JOIN calendar_by_school_year c
+    ON c.schoolNum_raw = CAST(skm.schoolNum AS VARCHAR2(10))
+   AND p.startDate_raw <= c.endDate_dt
+   AND NVL(p.endDate_raw, c.endDate_dt) >= c.startDate_dt
+  WHERE skm.schoolNum IS NOT NULL
+),
+
+grade_logic AS (
+  SELECT
+    em.*,
+    CASE
+      -- Numeric single digit (1-9) → pad to 2 digits
+      WHEN REGEXP_LIKE(TRIM(em.grade_level_raw), '^[0-9]$')
+        THEN LPAD(TRIM(em.grade_level_raw), 2, '0')
+
+      -- Numeric double digit (10,11,12 etc) → leave as-is
+      WHEN REGEXP_LIKE(TRIM(em.grade_level_raw), '^[0-9]{2,}$')
+        THEN TRIM(em.grade_level_raw)
+
+      -- Non-numeric values (KG, PK, etc) → leave as-is
+      ELSE TRIM(em.grade_level_raw)
+    END AS gradeLevel_final
+  FROM enr_mapped em
+),
+
+xform AS (
+  SELECT
+    SUBSTR(TRIM(studentNum_raw), 1, 15) AS studentNum,
+    startDate_raw AS startDate,
+    SUBSTR(TRIM(gradeLevel_final), 1, 20) AS gradeLevel,
+    SUBSTR(TRIM(schoolNum_raw), 1, 7) AS schoolNum,
+    SUBSTR(TRIM(calendarName_raw), 1, 30) AS calendarName,
+    endDate_raw AS endDate,
+    SUBSTR(TRIM(localStartStatus_raw),1,20) AS localStartStatus,
+    SUBSTR(TRIM(localEndStatus_raw),1,20) AS localEndStatus,
+    '' AS exclude,
+    'P' AS serviceType,
+    CASE WHEN startDate_raw = endDate_raw THEN '1' ELSE '' END AS noShow,
+    sourceTable_raw AS sourceTable
+  FROM grade_logic
+),
+
+dedup AS (
+  SELECT *
+  FROM (
+    SELECT x.*,
+           ROW_NUMBER() OVER (
+             PARTITION BY studentNum, startDate, gradeLevel, schoolNum, calendarName
+             ORDER BY CASE WHEN sourceTable = 'REENROLLMENTS' THEN 0 ELSE 1 END,
+                      endDate NULLS LAST
+           ) rn
+    FROM xform x
+  )
+  WHERE rn = 1
+),
+
+validated AS (
+  SELECT
+    d.*,
+    TRIM(
+      CASE WHEN studentNum IS NULL THEN 'ERR_REQUIRED_studentNum; ' END ||
+      CASE WHEN startDate IS NULL THEN 'ERR_REQUIRED_startDate; ' END ||
+      CASE WHEN gradeLevel IS NULL THEN 'ERR_REQUIRED_gradeLevel; ' END ||
+      CASE WHEN schoolNum IS NULL THEN 'ERR_REQUIRED_schoolNum; ' END ||
+      CASE WHEN calendarName IS NULL THEN 'ERR_REQUIRED_calendarName; ' END
+    ) AS validation_errors
+  FROM dedup d
+)
+
+SELECT
+  '"row_type","studentNum","startDate","gradeLevel","schoolNum","calendarName","endDate","localStartStatus","localEndStatus","exclude","serviceType","noShow","sourceTable","validation_errors"'
+FROM dual
+
+UNION ALL
+
+SELECT
+  '"'||CASE WHEN validation_errors IS NULL OR validation_errors = '' THEN 'CLEAN' ELSE 'ERROR' END||'",'||
+  '"'||studentNum||'",'||
+  '"'||TO_CHAR(startDate,'YYYY-MM-DD')||'",'||
+  '"'||gradeLevel||'",'||
+  '"'||schoolNum||'",'||
+  '"'||calendarName||'",'||
+  '"'||TO_CHAR(endDate,'YYYY-MM-DD')||'",'||
+  '"'||NVL(localStartStatus,'')||'",'||
+  '"'||NVL(localEndStatus,'')||'",'||
+  '"'||exclude||'",'||
+  '"'||serviceType||'",'||
+  '"'||noShow||'",'||
+  '"'||sourceTable||'",'||
+  '"'||REPLACE(NVL(validation_errors,''),'"','""')||'"'
+FROM validated;
